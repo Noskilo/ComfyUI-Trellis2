@@ -27,7 +27,11 @@ def resolve_device(device: Union[str, torch.device, None] = "auto") -> torch.dev
     if name == "xpu" and not _has_xpu():
         raise RuntimeError("Intel XPU device requested, but torch.xpu.is_available() is false.")
     if name == "cuda" and not torch.cuda.is_available():
-        raise RuntimeError("CUDA device requested, but torch.cuda.is_available() is false.")
+        if _has_xpu():
+            print("[Trellis2] CUDA was requested by the workflow, but CUDA is unavailable. Falling back to Intel XPU.")
+            return torch.device("xpu")
+        print("[Trellis2] CUDA was requested by the workflow, but CUDA is unavailable. Falling back to CPU.")
+        return torch.device("cpu")
     return torch.device(name)
 
 
