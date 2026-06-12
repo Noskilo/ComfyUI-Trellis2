@@ -8,11 +8,9 @@ from .base import Pipeline
 from . import samplers, rembg
 from ..modules.sparse import SparseTensor
 from ..modules import image_feature_extractor
-import o_voxel
-import cumesh
-import nvdiffrast.torch as dr
 import cv2
-import flex_gemm
+from ..utils.accelerator import cleanup as cleanup_device, optional_import, resolve_device
+from .trellis2_image_to_3d import sample_sparse_grid
 
 
 class Trellis2TexturingPipeline(Pipeline):
@@ -96,12 +94,12 @@ class Trellis2TexturingPipeline(Pipeline):
         return pipeline
 
     def to(self, device: torch.device) -> None:
-        self._device = device
+        self._device = resolve_device(device)
         if not self.low_vram:
-            super().to(device)
-            self.image_cond_model.to(device)
+            super().to(self._device)
+            self.image_cond_model.to(self._device)
             if self.rembg_model is not None:
-                self.rembg_model.to(device)
+                self.rembg_model.to(self._device)
 
     def preprocess_mesh(self, mesh: trimesh.Trimesh) -> trimesh.Trimesh:
         """
@@ -195,6 +193,7 @@ class Trellis2TexturingPipeline(Pipeline):
         Returns:
             SparseTensor: The encoded structured latent.
         """
+        o_voxel = optional_import("o_voxel", "Flexible dual grid conversion")
         vertices = torch.from_numpy(mesh.vertices).float()
         faces = torch.from_numpy(mesh.faces).long()
         
@@ -291,6 +290,10 @@ class Trellis2TexturingPipeline(Pipeline):
         resolution: int = 1024,
         texture_size: int = 1024,
     ) -> trimesh.Trimesh:
+        if not torch.cuda.is_available():
+            raise RuntimeError("UV texture rasterization requires CUDA/nvdiffrast. Use the main pipeline with bake_on_vertices for Intel Arc fallback.")
+        cumesh = optional_import("cumesh", "UV unwrapping")
+        dr = optional_import("nvdiffrast.torch", "Texture rasterization")
         vertices = mesh.vertices
         faces = mesh.faces
         normals = mesh.vertex_normals
@@ -323,11 +326,9 @@ class Trellis2TexturingPipeline(Pipeline):
         pos = dr.interpolate(vertices_torch.unsqueeze(0), rast, faces_torch)[0][0]
         
         attrs = torch.zeros(texture_size, texture_size, pbr_voxel.shape[1], device=self.device)
-        attrs[mask] = flex_gemm.ops.grid_sample.grid_sample_3d(
-            pbr_voxel.feats,
-            pbr_voxel.coords,
-            shape=torch.Size([*pbr_voxel.shape, *pbr_voxel.spatial_shape]),
-            grid=((pos[mask] + 0.5) * resolution).reshape(1, -1, 3),
+        attrs[mask] = sample_sparse_grid(
+            pbr_voxel,
+            ((pos[mask] + 0.5) * resolution).reshape(1, -1, 3),
             mode='trilinear',
         )
         

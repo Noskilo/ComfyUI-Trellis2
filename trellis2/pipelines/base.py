@@ -2,6 +2,7 @@ from typing import *
 import torch
 import torch.nn as nn
 from .. import models
+from ..utils.accelerator import resolve_device
 
 
 class Pipeline:
@@ -65,6 +66,8 @@ class Pipeline:
         raise RuntimeError("No device found.")
 
     def to(self, device: torch.device) -> None:
+        device = resolve_device(device)
+        self._device = device
         for model in self.models.values():
             if model is not None:
                 model.to(device)

@@ -15,14 +15,10 @@ import gc
 import os
 import folder_paths
 import trimesh
-import o_voxel
-import cumesh
-import nvdiffrast.torch as dr
 import cv2
-import flex_gemm
-from flex_gemm.ops.grid_sample import grid_sample_3d
 
 import random
+from ..utils.accelerator import cleanup as cleanup_device, manual_seed_all as accelerator_seed_all, optional_import, resolve_device
 
 from comfy.utils import ProgressBar
 
@@ -44,7 +40,54 @@ def seed_all(seed: int = 0):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+    accelerator_seed_all(seed)
+
+
+def sparse_grid_sample_nearest(sparse: SparseTensor, grid: torch.Tensor) -> torch.Tensor:
+    coords = sparse.coords
+    feats = sparse.feats
+    spatial_shape = sparse.spatial_shape
+    query = torch.round(grid.reshape(-1, 3)).to(coords.device, dtype=coords.dtype)
+    query = torch.cat([torch.zeros_like(query[:, :1]), query], dim=-1)
+    valid = (
+        (query[:, 1] >= 0)
+        & (query[:, 2] >= 0)
+        & (query[:, 3] >= 0)
+        & (query[:, 1] < spatial_shape[0])
+        & (query[:, 2] < spatial_shape[1])
+        & (query[:, 3] < spatial_shape[2])
+    )
+    out = feats.new_zeros((query.shape[0], feats.shape[-1]))
+    if not torch.any(valid):
+        return out
+    dims = torch.tensor([int(spatial_shape[0]), int(spatial_shape[1]), int(spatial_shape[2])], dtype=torch.long, device=coords.device)
+    src = coords.long()
+    qry = query.long()
+    src_keys = (((src[:, 0] * dims[0] + src[:, 1]) * dims[1] + src[:, 2]) * dims[2] + src[:, 3])
+    qry_keys = (((qry[valid, 0] * dims[0] + qry[valid, 1]) * dims[1] + qry[valid, 2]) * dims[2] + qry[valid, 3])
+    sorted_keys, order = torch.sort(src_keys)
+    pos = torch.searchsorted(sorted_keys, qry_keys)
+    found = (pos < sorted_keys.numel()) & (sorted_keys[pos.clamp_max(sorted_keys.numel() - 1)] == qry_keys)
+    if torch.any(found):
+        out_indices = torch.nonzero(valid, as_tuple=False).flatten()[found]
+        out[out_indices] = feats[order[pos[found]]]
+    return out
+
+
+def sample_sparse_grid(sparse: SparseTensor, grid: torch.Tensor, mode: str = "trilinear") -> torch.Tensor:
+    if sparse.device.type == "cuda":
+        try:
+            from flex_gemm.ops.grid_sample import grid_sample_3d
+            return grid_sample_3d(
+                sparse.feats,
+                sparse.coords,
+                shape=torch.Size([*sparse.shape, *sparse.spatial_shape]),
+                grid=grid,
+                mode=mode,
+            )
+        except Exception:
+            pass
+    return sparse_grid_sample_nearest(sparse, grid)
 
 class Trellis2ImageTo3DPipeline(Pipeline):
     """
@@ -181,9 +224,7 @@ class Trellis2ImageTo3DPipeline(Pipeline):
 
     def _cleanup_cuda(self):
         gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-            torch.cuda.empty_cache()
+        cleanup_device(self.device)
 
     @classmethod
     def from_pretrained(cls, path: str, config_file: str = "pipeline.json", keep_models_loaded = True, use_fp8 = False, use_reconviagen = False, isPixal3D = False) -> "Trellis2ImageTo3DPipeline":
@@ -526,13 +567,13 @@ class Trellis2ImageTo3DPipeline(Pipeline):
             self._cleanup_cuda()      
 
     def to(self, device: torch.device) -> None:
-        self._device = device
+        self._device = resolve_device(device)
         if not self.low_vram:
-            super().to(device)
+            super().to(self._device)
             if self.image_cond_model is not None:
-                self.image_cond_model.to(device)
+                self.image_cond_model.to(self._device)
             if self.rembg_model is not None:
-                self.rembg_model.to(device)
+                self.rembg_model.to(self._device)
 
     # =========================================================================
     # Proj mode condition building
@@ -1694,12 +1735,12 @@ class Trellis2ImageTo3DPipeline(Pipeline):
             if not self.keep_models_loaded:
                 self.unload_tex_slat_flow_model_1024()               
             
-        torch.cuda.empty_cache()
+        cleanup_device(self.device)
         if generate_texture_slat:
             out_mesh = self.decode_latent(shape_slat, tex_slat, res, use_tiled=use_tiled)
         else:
             out_mesh = self.decode_latent(shape_slat, None, res, use_tiled=use_tiled)
-        torch.cuda.empty_cache()
+        cleanup_device(self.device)
         pbar.update(1)              
         if return_latent:
             if generate_texture_slat:
@@ -2097,12 +2138,12 @@ class Trellis2ImageTo3DPipeline(Pipeline):
             if not self.keep_models_loaded:
                 self.unload_tex_slat_flow_model_1024()         
             
-        torch.cuda.empty_cache()
+        cleanup_device(self.device)
         if generate_texture_slat:
             out_mesh = self.decode_latent(shape_slat, tex_slat, res, use_tiled=use_tiled)
         else:
             out_mesh = self.decode_latent(shape_slat, None, res, use_tiled=use_tiled)
-        torch.cuda.empty_cache()
+        cleanup_device(self.device)
         pbar.update(1)              
 
         return out_mesh 
@@ -2342,12 +2383,12 @@ class Trellis2ImageTo3DPipeline(Pipeline):
             if pbar is not None:
                 pbar.update(1)
                  
-        torch.cuda.empty_cache()
+        cleanup_device(self.device)
         if generate_texture_slat:
             out_mesh = self.decode_latent(shape_slat, tex_slat, res, use_tiled=use_tiled)
         else:
             out_mesh = self.decode_latent(shape_slat, None, res, use_tiled=use_tiled)            
-        torch.cuda.empty_cache()
+        cleanup_device(self.device)
         
         if pbar is not None:
              pbar.update(1)
@@ -2915,6 +2956,7 @@ class Trellis2ImageTo3DPipeline(Pipeline):
             SparseTensor: The encoded structured latent.
         """
         print('Converting mesh to flexible dual grid ...')        
+        o_voxel = optional_import("o_voxel", "Flexible dual grid conversion")
         vertices = torch.from_numpy(mesh.vertices).float()
         faces = torch.from_numpy(mesh.faces).long()
         
@@ -2959,42 +3001,13 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         use_custom_normals = False,
         mesh_cluster_threshold_cone_half_angle_rad = 60.0,
         inpainting = 'telea',
-    ):        
+    ):
         vertices = mesh.vertices
         faces = mesh.faces
         normals = np.asarray(mesh.vertex_normals).copy()
         
-        vertices_torch = torch.from_numpy(vertices).float().cuda()
-        faces_torch = torch.from_numpy(faces).int().cuda()
-        if hasattr(mesh, 'visual') and hasattr(mesh.visual, 'uv') and mesh.visual.uv is not None:
-            uvs = mesh.visual.uv.copy()
-            uvs[:, 1] = 1 - uvs[:, 1]
-            uvs_torch = torch.from_numpy(uvs).float().cuda()
-        else:
-            _cumesh = cumesh.CuMesh()
-            _cumesh.init(vertices_torch, faces_torch)
-            print('Unwrapping mesh ...')
-            vertices_torch, faces_torch, uvs_torch, vmap = _cumesh.uv_unwrap(
-                compute_charts_kwargs={
-                    "threshold_cone_half_angle_rad": np.radians(mesh_cluster_threshold_cone_half_angle_rad),
-                    "refine_iterations": 0,
-                    "global_iterations": 1,
-                    "smooth_strength": 1,
-                },
-                return_vmaps=True,
-                verbose=True,
-            )
-            
-            del _cumesh
-            gc.collect()      
-            
-            vertices_torch = vertices_torch.cuda()
-            faces_torch = faces_torch.cuda()
-            uvs_torch = uvs_torch.cuda()
-            vertices = vertices_torch.cpu().numpy()
-            faces = faces_torch.cpu().numpy()
-            uvs = uvs_torch.cpu().numpy()
-            normals = normals[vmap.cpu().numpy()]
+        vertices_torch = torch.from_numpy(vertices).float().to(pbr_voxel.device)
+        faces_torch = torch.from_numpy(faces).int().to(pbr_voxel.device)
 
         # --- Branch: Bake On Vertices (skip UV unwrapping and texture creation) ---
         if bake_on_vertices:
@@ -3033,11 +3046,9 @@ class Trellis2ImageTo3DPipeline(Pipeline):
             
             # Sample attributes directly at vertex positions from the voxel grid
             # No BVH mapping needed - the voxel grid contains all the color information
-            vertex_attrs = grid_sample_3d(
-                pbr_voxel.feats,
-                pbr_voxel.coords,
-                shape=torch.Size([*pbr_voxel.shape, *pbr_voxel.spatial_shape]),
-                grid=((out_vertices - aabb[0]) / voxel_size).reshape(1, -1, 3),
+            vertex_attrs = sample_sparse_grid(
+                pbr_voxel,
+                ((out_vertices - aabb[0]) / voxel_size).reshape(1, -1, 3),
                 mode='trilinear',
             )
             
@@ -3097,9 +3108,46 @@ class Trellis2ImageTo3DPipeline(Pipeline):
             # Return empty placeholder textures for vertex color mode
             placeholder_texture = Image.new('RGBA', (1, 1), (0, 0, 0, 0))
             return (textured_mesh, placeholder_texture, placeholder_texture,)
+
+        if not torch.cuda.is_available():
+            raise RuntimeError("UV texture rasterization requires CUDA/nvdiffrast. Enable bake_on_vertices for the Intel Arc CPU/XPU fallback.")
+
+        vertices_torch = vertices_torch.cuda()
+        faces_torch = faces_torch.cuda()
+        if hasattr(mesh, 'visual') and hasattr(mesh.visual, 'uv') and mesh.visual.uv is not None:
+            uvs = mesh.visual.uv.copy()
+            uvs[:, 1] = 1 - uvs[:, 1]
+            uvs_torch = torch.from_numpy(uvs).float().cuda()
+        else:
+            cumesh = optional_import("cumesh", "UV unwrapping")
+            _cumesh = cumesh.CuMesh()
+            _cumesh.init(vertices_torch, faces_torch)
+            print('Unwrapping mesh ...')
+            vertices_torch, faces_torch, uvs_torch, vmap = _cumesh.uv_unwrap(
+                compute_charts_kwargs={
+                    "threshold_cone_half_angle_rad": np.radians(mesh_cluster_threshold_cone_half_angle_rad),
+                    "refine_iterations": 0,
+                    "global_iterations": 1,
+                    "smooth_strength": 1,
+                },
+                return_vmaps=True,
+                verbose=True,
+            )
+            
+            del _cumesh
+            gc.collect()      
+            
+            vertices_torch = vertices_torch.cuda()
+            faces_torch = faces_torch.cuda()
+            uvs_torch = uvs_torch.cuda()
+            vertices = vertices_torch.cpu().numpy()
+            faces = faces_torch.cpu().numpy()
+            uvs = uvs_torch.cpu().numpy()
+            normals = normals[vmap.cpu().numpy()]
                 
         # rasterize
         print('Finalizing mesh ...')
+        dr = optional_import("nvdiffrast.torch", "Texture rasterization")
         ctx = dr.RasterizeCudaContext()
         uvs_torch = torch.cat([uvs_torch * 2 - 1, torch.zeros_like(uvs_torch[:, :1]), torch.ones_like(uvs_torch[:, :1])], dim=-1).unsqueeze(0)
         rast, _ = dr.rasterize(
@@ -3113,11 +3161,9 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         pos = dr.interpolate(vertices_torch.unsqueeze(0), rast, faces_torch)[0][0]
         
         attrs = torch.zeros(texture_size, texture_size, pbr_voxel.shape[1], device=self.device)
-        attrs[mask] = flex_gemm.ops.grid_sample.grid_sample_3d(
-            pbr_voxel.feats,
-            pbr_voxel.coords,
-            shape=torch.Size([*pbr_voxel.shape, *pbr_voxel.spatial_shape]),
-            grid=((pos[mask] + 0.5) * resolution).reshape(1, -1, 3),
+        attrs[mask] = sample_sparse_grid(
+            pbr_voxel,
+            ((pos[mask] + 0.5) * resolution).reshape(1, -1, 3),
             mode='trilinear',
         )
         
@@ -3256,9 +3302,9 @@ class Trellis2ImageTo3DPipeline(Pipeline):
             if not self.keep_models_loaded:
                 self.unload_shape_slat_flow_model_1024()
 
-        torch.cuda.empty_cache()
+        cleanup_device(self.device)
         pbr_voxel = self.decode_tex_slat(tex_slat)
-        torch.cuda.empty_cache()
+        cleanup_device(self.device)
         
         out_mesh, baseColorTexture, metallicRoughnessTexture = self.postprocess_mesh(mesh, pbr_voxel, resolution, texture_size, texture_alpha_mode, double_side_material, bake_on_vertices, use_custom_normals, mesh_cluster_threshold_cone_half_angle_rad, inpainting)
         return out_mesh, baseColorTexture, metallicRoughnessTexture
@@ -3364,14 +3410,15 @@ class Trellis2ImageTo3DPipeline(Pipeline):
             if not self.keep_models_loaded:
                 self.unload_shape_slat_flow_model_1024()
                 
-        torch.cuda.empty_cache()
+        cleanup_device(self.device)
         pbr_voxel = self.decode_tex_slat(tex_slat)
-        torch.cuda.empty_cache()
+        cleanup_device(self.device)
         
         out_mesh, baseColorTexture, metallicRoughnessTexture = self.postprocess_mesh(mesh, pbr_voxel, resolution, texture_size, texture_alpha_mode, double_side_material, bake_on_vertices, use_custom_normals, mesh_cluster_threshold_cone_half_angle_rad, inpainting)
         return out_mesh, baseColorTexture, metallicRoughnessTexture        
     
     def get_coords_from_trimesh(self, mesh, resolution):
+        o_voxel = optional_import("o_voxel", "Flexible dual grid conversion")
         vertices = torch.from_numpy(mesh.vertices).float()
         faces = torch.from_numpy(mesh.faces).long()
         
@@ -3641,12 +3688,12 @@ class Trellis2ImageTo3DPipeline(Pipeline):
             if not self.keep_models_loaded:
                 self.unload_tex_slat_flow_model_1024()                 
                 
-        torch.cuda.empty_cache()
+        cleanup_device(self.device)
         if generate_texture_slat:
             out_mesh = self.decode_latent(shape_slat, tex_slat, res, use_tiled=use_tiled)
         else:
             out_mesh = self.decode_latent(shape_slat, None, res, use_tiled=use_tiled)
-        torch.cuda.empty_cache()
+        cleanup_device(self.device)
         
         if return_latent:
             if generate_texture_slat:
@@ -3727,7 +3774,7 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         if not self.keep_models_loaded:
             self.unload_sparse_structure_model()         
         del cond_ss
-        torch.cuda.empty_cache()
+        cleanup_device(self.device)
 
         # ---- Stage 2: Shape LR 512 (proj) ----
         image_cond_model = self.load_pixal3d_image_cond_shape_512()
@@ -3748,7 +3795,7 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         if not self.keep_models_loaded:
             self.unload_shape_slat_flow_model_512()        
         del cond_shape_lr
-        torch.cuda.empty_cache()
+        cleanup_device(self.device)
 
         # ---- Stage 3a: Upsample LR → HR ----
         self.load_shape_slat_decoder()
@@ -3779,7 +3826,7 @@ class Trellis2ImageTo3DPipeline(Pipeline):
 
         actual_grid_res = actual_hr_resolution // 16
         del lr_slat, hr_coords, quant_coords
-        torch.cuda.empty_cache()
+        cleanup_device(self.device)
 
         # ---- Stage 3b: Shape HR (proj) ----
         image_cond_model = self.load_pixal3d_image_cond_shape_1024()
@@ -3822,7 +3869,7 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         if not self.keep_models_loaded:
             self.unload_shape_slat_flow_model_1024()        
         del cond_shape_hr, noise_hr, hr_slat, hr_coords_unique
-        torch.cuda.empty_cache()
+        cleanup_device(self.device)
 
         if generate_texture_slat:
             # ---- Stage 4: Texture (proj) ----
@@ -3851,7 +3898,7 @@ class Trellis2ImageTo3DPipeline(Pipeline):
                 self.unload_tex_slat_flow_model_1024()             
             
             del cond_tex
-            torch.cuda.empty_cache()
+            cleanup_device(self.device)
 
         # ---- Stage 5: Decode ----
         res = actual_hr_resolution

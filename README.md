@@ -84,6 +84,33 @@ To use **TencentARC/Pixal3D-T** model, it's required to install **natten** packa
 
 ---
 
+## Intel Arc / XPU Notes
+
+Experimental Intel Arc support targets Ubuntu 24.04/25.10 with PyTorch XPU. Install the Intel GPU driver, then install PyTorch from the XPU wheel index:
+
+```bash
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/xpu
+```
+
+Verify:
+
+```bash
+python -c "import torch; print(torch.xpu.is_available())"
+```
+
+Recommended Trellis2 LoadModel settings for Intel Arc:
+
+- `device`: `auto` or `xpu`
+- `backend`: any value is accepted, but XPU/CPU runs force `sdpa`
+- `sparse_backend`: any value is accepted, but XPU/CPU runs force `sdpa`
+- `conv_backend`: any value is accepted, but XPU/CPU runs force `torch_native`
+- Disable `use_reconviagen`; the VGGT/ReconViaGen path is still CUDA-only
+- Prefer `bake_on_vertices=True` for texture output; UV rasterization still requires CUDA/nvdiffrast
+
+CUDA-only postprocess/projection/render nodes remain available on NVIDIA systems. On Intel Arc, use MeshLib/Open3D/trimesh CPU fallback nodes where available.
+
+---
+
 ## ⚙️ Installation Guide
 
 > Tested on **Windows 11** with **Python 3.11** and **Torch = 2.7.0 + cu128**.

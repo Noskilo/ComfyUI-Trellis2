@@ -12,8 +12,6 @@ from tqdm import tqdm
 import time
 import shutil
 import uuid
-import triton
-import triton.compiler
 import math
 
 import folder_paths
@@ -25,19 +23,14 @@ import copy
 
 import pymeshlab
 
-import cumesh as CuMesh
-import o_voxel
-
 import meshlib.mrmeshnumpy as mrmeshnumpy
 import meshlib.mrmeshpy as mrmeshpy
-
-import nvdiffrast.torch as dr
-from flex_gemm.ops.grid_sample import grid_sample_3d
 
 import comfy.model_management as mm
 from comfy.utils import load_torch_file, ProgressBar, common_upscale
 import comfy.utils
 
+from .trellis2.utils.accelerator import cleanup as cleanup_device, manual_seed_all as accelerator_seed_all, resolve_device, autocast as device_autocast
 from .trellis2.pipelines import Trellis2ImageTo3DPipeline
 from .trellis2.representations import Mesh, MeshWithVoxel
 from .trellis2.modules.attention import config
@@ -47,6 +40,45 @@ from .trellis2.modules.sparse import SparseTensor
 
 script_directory = os.path.dirname(os.path.abspath(__file__))
 comfy_path = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+
+
+class _MissingOptionalDependency:
+    def __init__(self, module_name, feature):
+        self.module_name = module_name
+        self.feature = feature
+
+    def _raise(self):
+        raise RuntimeError(
+            f"{self.feature} requires optional dependency '{self.module_name}', which is not available. "
+            "On Intel Arc, use the CPU fallback node/option when available."
+        )
+
+    def __getattr__(self, name):
+        self._raise()
+
+    def __call__(self, *args, **kwargs):
+        self._raise()
+
+
+try:
+    import cumesh as CuMesh
+except Exception:
+    CuMesh = _MissingOptionalDependency("cumesh", "CuMesh operations")
+
+try:
+    import o_voxel
+except Exception:
+    o_voxel = _MissingOptionalDependency("o_voxel", "o_voxel operations")
+
+try:
+    import nvdiffrast.torch as dr
+except Exception:
+    dr = _MissingOptionalDependency("nvdiffrast", "nvdiffrast rendering")
+
+try:
+    from flex_gemm.ops.grid_sample import grid_sample_3d
+except Exception:
+    grid_sample_3d = _MissingOptionalDependency("flex_gemm", "3D sparse grid sampling")
 
 BASE_CACHE_DIR = Path(os.path.dirname(os.path.realpath(__file__))) / "triton_caches"
 #os.environ["TRITON_ALWAYS_COMPILE"] = "1"
@@ -134,15 +166,13 @@ def parse_string_to_int_list(number_string):
     print(f"Error converting string to integer: {e}. Please ensure all values are valid numbers.")
     return []
 
-def reset_cuda():    
-    # Synchronize to ensure all GPU operations complete
-    torch.cuda.synchronize()     
-    
-    # Force garbage collection of Python objects
+def reset_accelerator(device="auto"):
     gc.collect()    
-    
-    # Clear PyTorch CUDA cache
-    torch.cuda.empty_cache()
+    cleanup_device(device)
+
+
+def reset_cuda():
+    reset_accelerator("cuda" if torch.cuda.is_available() else "cpu")
 
 def pil2tensor(image):
     return torch.from_numpy(np.array(image).astype(np.float32) / 255.0)[None,]
@@ -341,11 +371,11 @@ class Trellis2LoadModel:
             "required": {
                 "modelname": (["microsoft/TRELLIS.2-4B","visualbruno/TRELLIS.2-4B-FP8","TencentARC/Pixal3D-T"],{"default":"microsoft/TRELLIS.2-4B"}),
                 "backend": (["flash_attn","xformers","sdpa","flash_attn_3"],{"default":"flash_attn"}),
-                "device": (["cpu","cuda"],{"default":"cuda"}),
+                "device": (["auto","cpu","cuda","xpu"],{"default":"auto"}),
                 "low_vram": ("BOOLEAN",{"default":True}),
                 "keep_models_loaded": ("BOOLEAN", {"default":True}),
-                "conv_backend": (["spconv","torchsparse","flex_gemm"],{"default":"flex_gemm"}),
-                "sparse_backend": (["xformers","flash_attn"],{"default":"flash_attn"}),
+                "conv_backend": (["spconv","torchsparse","flex_gemm","torch_native"],{"default":"flex_gemm"}),
+                "sparse_backend": (["xformers","flash_attn","flash_attn_3","sdpa","naive"],{"default":"flash_attn"}),
                 "use_reconviagen": ("BOOLEAN",{"default":False}),
                 #"naf_chunk_size":(["None","144","208","272","336","400","464","528","592","656","720","784","848","912","976","1024"],{"default":"None"}),
             }
@@ -361,18 +391,25 @@ class Trellis2LoadModel:
         import requests
         
         os.environ['OPENCV_IO_ENABLE_OPENEXR'] = '1'
-        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"  # Can save GPU memory
+        resolved_device = resolve_device(device)
+        if resolved_device.type == "cuda":
+            os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"  # Can save GPU memory
         #os.environ["FLEX_GEMM_AUTOTUNE_CACHE_PATH"] = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'autotune_cache.json')
         #os.environ["FLEX_GEMM_AUTOTUNER_VERBOSE"] = '1'        
+        if resolved_device.type in ("cpu", "xpu"):
+            backend = "sdpa"
+            sparse_backend = "sdpa"
+            conv_backend = "torch_native"
         os.environ['ATTN_BACKEND'] = backend
         
         config.set_backend(backend)
         sparseconfig.set_attn_backend(sparse_backend)
         sparseconfig.set_conv_backend(conv_backend)
         
-        reset_cuda()
-        
-        torch.backends.cudnn.benchmark = False        
+        reset_accelerator(resolved_device)
+
+        if resolved_device.type == "cuda":
+            torch.backends.cudnn.benchmark = False
             
         model_path = os.path.join(folder_paths.models_dir, modelname)
         
@@ -508,13 +545,13 @@ class Trellis2LoadModel:
         # else:
             # pipeline.naf_chunk_size = int(naf_chunk_size)
         
-        if device=="cuda":
+        if resolved_device.type == "cuda":
             if low_vram:
                 pipeline.cuda()
             else:
-                pipeline.to(device)
+                pipeline.to(resolved_device)
         else:
-            pipeline.to(device)
+            pipeline.to(resolved_device)
         
         return (pipeline,)
         
@@ -4029,7 +4066,7 @@ class Trellis2SparseGenerator:
         random.seed(seed)
         np.random.seed(seed)
         torch.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)         
+        accelerator_seed_all(seed, "auto")         
         
 class Trellis2ShapeGenerator:
     @classmethod
@@ -5444,6 +5481,8 @@ class Trellis2SparseGeneratorWithReconViaGen:
         return (coords, sparse_structure_resolution, pipeline)
         
     def load_vggt_model(self, pipeline):
+        if resolve_device(pipeline.device).type != "cuda":
+            raise RuntimeError("ReconViaGen/VGGT is CUDA-only in this port. Disable use_reconviagen on Intel Arc.")
         if pipeline.VGGT_model is None:
             from .vggt.vggt.models.vggt import VGGT
             pipeline.VGGT_dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16            
@@ -5467,9 +5506,7 @@ class Trellis2SparseGeneratorWithReconViaGen:
         
         gc.collect()
         
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-            torch.cuda.empty_cache()        
+        reset_accelerator(pipeline.device)        
         
         
     def seed_all(self, seed: int = 0):
@@ -5480,7 +5517,7 @@ class Trellis2SparseGeneratorWithReconViaGen:
         random.seed(seed)
         np.random.seed(seed)
         torch.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed) 
+        accelerator_seed_all(seed, "auto") 
 
     @torch.no_grad()
     def _run_ss_stage_direct(
@@ -5507,13 +5544,15 @@ class Trellis2SparseGeneratorWithReconViaGen:
             coords : (N, 4) int tensor  [batch_idx, x, y, z]  in [0, target_ss_res)
         """           
             
+        if resolve_device(pipeline.device).type != "cuda":
+            raise RuntimeError("ReconViaGen/VGGT sparse stage is CUDA-only in this port. Disable use_reconviagen on Intel Arc.")
         cuda_device = torch.device('cuda')
 
         if pipeline.low_vram:
             pipeline.VGGT_model.to(cuda_device)
 
         with torch.no_grad():
-            with torch.cuda.amp.autocast(dtype=pipeline.VGGT_dtype):
+            with device_autocast(cuda_device, dtype=pipeline.VGGT_dtype):
                 aggregated_tokens_list, _ = self.vggt_feat(pipeline, images)
             b, n, _, _ = aggregated_tokens_list[0].shape
             image_cond = self.encode_image(pipeline, images).reshape(b, n, -1, 1024)
@@ -5524,7 +5563,7 @@ class Trellis2SparseGeneratorWithReconViaGen:
         reso = ss_flow_model.resolution
         ss_noise = torch.randn(1, ss_flow_model.in_channels, reso, reso, reso).to(cuda_device)
 
-        with torch.autocast('cuda', dtype=torch.float16):
+        with device_autocast(cuda_device, dtype=torch.float16):
             ss_latent = pipeline.sparse_structure_sampler.sample(
                 ss_flow_model,
                 ss_noise,
@@ -5654,7 +5693,7 @@ class Trellis2SparseGeneratorWithReconViaGen:
             pipeline.VGGT_model.to('cpu')
             decoder.to('cpu')
             ss_cond = pipeline._cond_cpu(ss_cond)
-            torch.cuda.empty_cache()
+            reset_accelerator(cuda_device)
 
         return coords
         
@@ -5727,7 +5766,7 @@ class Trellis2SparseGeneratorWithReconViaGen:
             raise ValueError(f"Unsupported type of image: {type(image)}")
 
         with torch.no_grad():
-            with torch.cuda.amp.autocast(dtype=pipeline.VGGT_dtype):
+            with device_autocast(pipeline.device, dtype=pipeline.VGGT_dtype):
                 # Predict attributes including cameras, depth maps, and point maps.
                 aggregated_tokens_list, _ = pipeline.VGGT_model.aggregator(image[None])
 
@@ -6201,7 +6240,7 @@ class Trellis2SparseMultiViewGenerator:
         random.seed(seed)
         np.random.seed(seed)
         torch.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)   
+        accelerator_seed_all(seed, "auto")   
 
 class Trellis2ShapeMultiViewGenerator:
     @classmethod
